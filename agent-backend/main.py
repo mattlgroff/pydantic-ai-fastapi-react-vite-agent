@@ -22,7 +22,6 @@ Run with: fastapi run main.py or fastapi dev main.py
 import asyncio
 import json
 import logging
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 # FastAPI for web server and async streaming
@@ -37,6 +36,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Pydantic-AI for the AI agent functionality
 from pydantic_ai import Agent
 from pydantic_ai.models.groq import GroqModel
+from pydantic_ai.providers.groq import GroqProvider
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest, 
@@ -89,30 +89,15 @@ print(f"🔑 GROQ API key configured: {'✓' if settings.groq_api_key else '❌'
 # 3. PYDANTIC MODELS (Request/Response schemas)
 # =============================================================================
 
-class UserContext(BaseModel):
-    """
-    User context information from authentication.
-    
-    This is compatible with Vercel AI SDK's user context format.
-    In a real app, this would come from your authentication middleware.
-    """
-    first_name: str
-    last_name: str
-    email: str
-    timezone: Optional[str] = None  # IANA timezone name (e.g., "America/Chicago")
-
-
 class ChatMessageRequest(BaseModel):
     """
     Request model for agent chat messages.
     
-    This matches the Vercel AI SDK message format exactly:
+    This matches the Vercel AI SDK message format:
     - messages: Array of conversation messages
-    - conversation_id: Unique identifier for the conversation
-    - user_context: Optional user information
     
     The 'messages' array contains objects with:
-    - id: Unique message ID
+    - id: Unique message ID (optional)
     - role: 'user' or 'assistant'  
     - content: Message text (fallback)
     - parts: Array of message parts (v5 format)
@@ -120,8 +105,6 @@ class ChatMessageRequest(BaseModel):
       - text: The actual text content (for text parts)
     """
     messages: List[Dict[str, Any]]
-    conversation_id: str
-    user_context: Optional[UserContext] = None
 
 
 # =============================================================================
@@ -130,7 +113,6 @@ class ChatMessageRequest(BaseModel):
 
 def convert_vercel_messages_to_pydantic(
     messages: List[Dict[str, Any]], 
-    user_context: Optional[UserContext] = None,
     system_prompt_content: Optional[str] = None
 ) -> tuple[str, List[ModelMessage]]:
     """
@@ -156,11 +138,10 @@ def convert_vercel_messages_to_pydantic(
     
     Args:
         messages: List of Vercel AI SDK message objects
-        user_context: Optional user context to prepend to user prompt
         system_prompt_content: System prompt to include in history
         
     Returns:
-        Tuple of (latest_user_prompt, message_history)
+        Tuple of (latest_user_message, message_history)
     """
     logger.info(f"Converting {len(messages) if messages else 0} messages")
     
@@ -168,7 +149,7 @@ def convert_vercel_messages_to_pydantic(
         return "", []
     
     # Extract the latest user message as the prompt
-    latest_user_prompt = ""
+    latest_user_message = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
             parts = msg.get("parts", [])
@@ -177,24 +158,11 @@ def convert_vercel_messages_to_pydantic(
                 text_parts = [
                     p.get("text", "") for p in parts if p.get("type") == "text"
                 ]
-                latest_user_prompt = " ".join(text_parts)
+                latest_user_message = " ".join(text_parts)
             elif "content" in msg:
                 # Fallback to direct content field
-                latest_user_prompt = msg["content"]
+                latest_user_message = msg["content"]
             break
-    
-    # Prepend user context to the latest prompt if available
-    if user_context and latest_user_prompt:
-        user_name = f"{user_context.first_name} {user_context.last_name}"
-        context_prefix = f"""### User Context
-Signed-In User: {user_name} - {user_context.email}
-
----
-
-### User Message
-
-"""
-        latest_user_prompt = context_prefix + latest_user_prompt
     
     # Convert all previous messages (excluding the latest) to ModelMessage format
     message_history = []
@@ -286,10 +254,95 @@ Signed-In User: {user_name} - {user_context.email}
                         )
                         message_history.append(tool_return)
     
-    return latest_user_prompt, message_history
+    return latest_user_message, message_history
 
 
-async def to_data_stream_protocol(agent_stream, run_context):
+async def to_data_stream_protocol(node, run):
+    """Convert Pydantic AI agent stream node to Vercel AI SDK Data Stream Protocol.
+    
+    This is a simplified version of the full stream_utils implementation,
+    focused on basic text streaming and tool calls for the math agent.
+    
+    Args:
+        node: Agent stream node from agent.iter()
+        run: Agent run context
+
+    Yields:
+        str: Data stream protocol formatted chunks
+    """
+    # Import Agent here to avoid circular imports
+    from pydantic_ai import Agent
+    
+    if not hasattr(run, "_tool_calls_pending"):
+        run._tool_calls_pending = {}
+
+    if Agent.is_user_prompt_node(node):
+        # User prompts are handled by the frontend, skip
+        pass
+    elif Agent.is_model_request_node(node):
+        async with node.stream(run.ctx) as request_stream:
+            async for event in request_stream:
+                logger.info(f"📊 Event type: {type(event).__name__}")
+                
+                if isinstance(event, PartStartEvent):
+                    if event.part.part_kind == "text":
+                        if not hasattr(run, "_text_id"):
+                            run._text_id = "text-" + str(id(event))
+                        chunk = "data: {}\n\n".format(
+                            json.dumps({"type": "text-start", "id": run._text_id})
+                        )
+                        yield chunk
+
+                        # Check if PartStartEvent contains initial content
+                        if hasattr(event.part, "content") and event.part.content:
+                            initial_content = event.part.content
+                            initial_chunk = "data: {}\n\n".format(
+                                json.dumps({
+                                    "type": "text-delta",
+                                    "id": run._text_id,
+                                    "delta": initial_content,
+                                })
+                            )
+                            yield initial_chunk
+                            
+                    elif event.part.part_kind == "tool-call":
+                        run._tool_calls_pending[event.part.tool_call_id] = {
+                            "toolName": event.part.tool_name,
+                            "args_parts": [],
+                        }
+                        
+                elif isinstance(event, PartDeltaEvent):
+                    if event.delta.part_delta_kind == "text":
+                        if not hasattr(run, "_text_id"):
+                            run._text_id = "text-main"
+                        chunk = "data: {}\n\n".format(
+                            json.dumps({
+                                "type": "text-delta",
+                                "id": run._text_id,
+                                "delta": event.delta.content_delta,
+                            })
+                        )
+                        yield chunk
+                        
+    elif Agent.is_call_tools_node(node):
+        # Handle tool calls - for the math agent's sum_numbers tool
+        async with node.stream(run.ctx) as tool_stream:
+            async for event in tool_stream:
+                # For now, we'll handle basic tool events
+                # In a full implementation, you'd handle FunctionToolCallEvent, etc.
+                pass
+                        
+    elif Agent.is_end_node(node):
+        # Send text-end if we were streaming text
+        if hasattr(run, "_text_id"):
+            chunk = "data: {}\n\n".format(
+                json.dumps({"type": "text-end", "id": run._text_id})
+            )
+            yield chunk
+            delattr(run, "_text_id")
+
+
+async def old_to_data_stream_protocol(agent_stream, run_context):
     """
     Convert Pydantic-AI agent stream to Vercel AI SDK Data Stream Protocol.
     
@@ -410,7 +463,8 @@ Examples of when to use sum_numbers:
     # Configure the LLM model
     # Using Groq for fast inference with the API key from settings
     # The API key is loaded from environment variables or .env file
-    model = GroqModel("llama-3.1-70b-versatile", api_key=settings.groq_api_key)
+    provider = GroqProvider(api_key=settings.groq_api_key)
+    model = GroqModel("qwen/qwen3-32b", provider=provider)
     
     # Create the agent with the model and system prompt
     agent = Agent(model, system_prompt=system_prompt)
@@ -457,17 +511,10 @@ app = FastAPI(
 print("🚀 FastAPI Math Agent Server Starting!")
 
 # Add CORS middleware to allow frontend connections
-# This enables your frontend (React, Next.js, etc.) to make requests to this server
+# This enables your Vite frontend to make requests to this server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",   # Next.js default
-        "http://localhost:5173",   # Vite default  
-        "http://localhost:5174",   # Vite alternative
-        "http://localhost:8000",   # FastAPI default
-        "http://localhost:8001",   # FastAPI alternative
-    ],
-    allow_credentials=True,
+    allow_origins=["http://localhost:5173"],  # Vite default
     allow_methods=["*"],  # Allow all HTTP methods
     allow_headers=["*"],  # Allow all headers
 )
@@ -475,55 +522,36 @@ app.add_middleware(
 print("🌐 CORS middleware configured for frontend connections")
 
 
-@app.get("/health")
-async def health_check():
-    """
-    Health check endpoint.
-    
-    This is useful for:
-    - Checking if the server is running
-    - Load balancer health checks  
-    - Monitoring and uptime checks
-    """
-    return {
-        "status": "healthy",
-        "service": "Math Agent",
-        "version": "1.0.0",
-        "timestamp": datetime.now().isoformat(),
-        "capabilities": ["addition", "tool_calling", "streaming"]
-    }
-
-
-# =============================================================================
-# 6. MAIN /agent ENDPOINT - This is where the magic happens!
-# =============================================================================
-
 @app.post("/agent")
 async def chat_with_agent(request: ChatMessageRequest) -> StreamingResponse:
     """
-    Main chat endpoint that's compatible with Vercel AI SDK.
+    The main (and only) endpoint for this minimalist demonstration.
     
-    This endpoint:
-    1. Receives messages in Vercel AI SDK format
-    2. Converts them to Pydantic-AI format
-    3. Runs the math agent
-    4. Streams the response back in AI SDK format
-    5. Handles tool calls and streaming text
+    This shows how to host a Pydantic-AI agent in FastAPI for chat with tool calling
+    using the Vercel AI SDK on the frontend. This minimalist approach focuses on the 
+    core concepts without authentication, conversation persistence, or other features.
     
-    The Vercel AI SDK will POST to this endpoint with a request like:
+    In a real application, you could add:
+    - Health check endpoint (/health)
+    - Conversation history endpoints (/conversations)
+    - User authentication and authorization
+    - Rate limiting and request validation
+    - Logging and monitoring
+    - Multiple agent types
+    
+    This endpoint demonstrates:
+    1. Receiving Vercel AI SDK message format
+    2. Converting to Pydantic-AI format  
+    3. Running the agent with tool calling
+    4. Streaming responses back via Server-Sent Events
+    5. Handling conversation history
+    
+    Example request from Vercel AI SDK:
     {
         "messages": [
-            {
-                "role": "user", 
-                "content": "What's 15 + 27?",
-                "parts": [{"type": "text", "text": "What's 15 + 27?"}]
-            }
-        ],
-        "conversation_id": "conv-123",
-        "user_context": {"first_name": "John", "last_name": "Doe", "email": "john@example.com"}
+            {"role": "user", "content": "What's 15 + 27?", "parts": [{"type": "text", "text": "What's 15 + 27?"}]}
+        ]
     }
-    
-    The response will be a Server-Sent Events stream that the AI SDK can consume.
     """
     print(f"🚀 Received chat request with {len(request.messages)} messages")
     
@@ -531,14 +559,32 @@ async def chat_with_agent(request: ChatMessageRequest) -> StreamingResponse:
         # Create the math agent
         agent = create_math_agent()
         
+        # Get the system prompt content as string (from the agent creation)
+        system_prompt_content = """You are a helpful math assistant with access to calculation tools.
+
+IMPORTANT INSTRUCTIONS:
+- When given math problems, always use your included tools for accurate calculations
+- Use the sum_numbers tool for addition operations
+- Show your work and explain the calculation process
+- Be friendly and educational in your responses
+- If asked to do math that your tools can't handle, explain what you can help with
+
+Available tools:
+- sum_numbers: Add multiple numbers together
+
+Examples of when to use sum_numbers:
+- "What's 15 + 27 + 8?" -> Use sum_numbers(15, 27, 8)
+- "Add 100.5 and 200.25" -> Use sum_numbers(100.5, 200.25)
+- "Sum these: 1, 2, 3, 4, 5" -> Use sum_numbers(1, 2, 3, 4, 5)
+"""
+        
         # Convert Vercel AI SDK messages to Pydantic-AI format
-        user_prompt, message_history = convert_vercel_messages_to_pydantic(
+        user_message, message_history = convert_vercel_messages_to_pydantic(
             request.messages,
-            request.user_context,
-            agent.system_prompt  # Pass the agent's system prompt
+            system_prompt_content=system_prompt_content
         )
         
-        print(f"📝 User prompt: {user_prompt[:100]}...")
+        print(f"📝 User message: {user_message[:100]}...")
         print(f"📚 Message history: {len(message_history)} previous messages")
         
         # Create the streaming response function
@@ -550,39 +596,12 @@ async def chat_with_agent(request: ChatMessageRequest) -> StreamingResponse:
             by the Vercel AI SDK on the frontend.
             """
             try:
-                # Run the agent with conversation context
-                agent_run = agent.run_stream(user_prompt, message_history=message_history)
-                
-                # Track the response content for logging
-                content_parts = []
-                text_id = None
-                
-                async for event in agent_run:
-                    print(f"🔄 Processing event: {type(event).__name__}")
-                    
-                    # Handle text streaming events
-                    if hasattr(event, 'part') and hasattr(event.part, 'part_kind'):
-                        if event.part.part_kind == "text":
-                            if isinstance(event, PartStartEvent):
-                                text_id = f"text-{id(event)}"
-                                yield f"data: {json.dumps({'type': 'text-start', 'id': text_id})}\n\n"
-                                
-                            elif isinstance(event, PartDeltaEvent):
-                                if hasattr(event.delta, 'content_delta'):
-                                    delta = event.delta.content_delta
-                                    content_parts.append(delta)
-                                    yield f"data: {json.dumps({'type': 'text-delta', 'id': text_id, 'delta': delta})}\n\n"
-                    
-                    # Handle tool calls - simplified for this demo
-                    # In the full implementation, you'd handle ToolCallStartEvent, etc.
-                    
-                # End the text stream
-                if text_id:
-                    yield f"data: {json.dumps({'type': 'text-end', 'id': text_id})}\n\n"
-                
-                # Log the complete response
-                complete_response = ''.join(content_parts)
-                print(f"✅ Agent response complete: {complete_response[:200]}...")
+                # Run the agent with conversation context - matching the working pattern
+                async with agent.iter(user_message, message_history=message_history) as agent_run:
+                    async for node in agent_run:
+                        # Convert to data stream protocol format - use the same pattern as the working version
+                        async for chunk in to_data_stream_protocol(node, agent_run):
+                            yield chunk
                 
             except Exception as e:
                 print(f"❌ Error in agent stream: {str(e)}")
@@ -613,7 +632,7 @@ async def chat_with_agent(request: ChatMessageRequest) -> StreamingResponse:
 
 
 # =============================================================================
-# 7. MAIN ENTRY POINT
+# 7. ENTRY POINT
 # =============================================================================
 
 # No need for explicit uvicorn or __main__ block!
