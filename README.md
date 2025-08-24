@@ -2,6 +2,10 @@
 
 A modern tech stack for building AI agents that combines the best of Python and TypeScript ecosystems. This example demonstrates how to connect **[Pydantic AI](https://ai.pydantic.dev/)** backends with **[Vercel AI SDK](https://ai-sdk.dev/docs/introduction)** frontends through streaming-compatible APIs.
 
+![Math Agent UI](MathAgent.png)
+
+The UI above shows a simple Math Agent example that currently has one tool (sum).
+
 ## Tech Stack
 
 ### Backend (Python)
