@@ -1,0 +1,12 @@
+[project]
+name = "agent-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.116.1",
+    "pydantic-ai>=0.7.4",
+    "pydantic-settings>=2.10.1",
+    "python-dotenv>=1.1.1",
+]
