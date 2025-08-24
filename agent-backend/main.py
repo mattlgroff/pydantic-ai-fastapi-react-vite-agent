@@ -260,8 +260,8 @@ def convert_vercel_messages_to_pydantic(
 async def to_data_stream_protocol(node, run):
     """Convert Pydantic AI agent stream node to Vercel AI SDK Data Stream Protocol.
     
-    This is a simplified version of the full stream_utils implementation,
-    focused on basic text streaming and tool calls for the math agent.
+    This implementation handles text streaming and tool calls for the math agent,
+    emitting proper tool-input-available and tool-output-available events.
     
     Args:
         node: Agent stream node from agent.iter()
@@ -270,11 +270,13 @@ async def to_data_stream_protocol(node, run):
     Yields:
         str: Data stream protocol formatted chunks
     """
-    # Import Agent here to avoid circular imports
     from pydantic_ai import Agent
+    from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent
     
     if not hasattr(run, "_tool_calls_pending"):
         run._tool_calls_pending = {}
+    if not hasattr(run, "_tool_name_map"):
+        run._tool_name_map = {}
 
     if Agent.is_user_prompt_node(node):
         # User prompts are handled by the frontend, skip
@@ -325,12 +327,48 @@ async def to_data_stream_protocol(node, run):
                         yield chunk
                         
     elif Agent.is_call_tools_node(node):
-        # Handle tool calls - for the math agent's sum_numbers tool
+        # Handle tool calls with proper event emission
         async with node.stream(run.ctx) as tool_stream:
             async for event in tool_stream:
-                # For now, we'll handle basic tool events
-                # In a full implementation, you'd handle FunctionToolCallEvent, etc.
-                pass
+                if isinstance(event, FunctionToolCallEvent):
+                    print(f"🔧 TOOL CALL STARTED: {event.part.tool_name}")
+                    print(f"🔧 TOOL INPUT: {json.dumps(event.part.args, indent=2)}")
+                    
+                    # Store tool name mapping
+                    run._tool_name_map[event.part.tool_call_id] = event.part.tool_name
+                    
+                    # Emit tool-input-available event
+                    yield "data: {}\n\n".format(
+                        json.dumps({
+                            "type": "tool-input-available",
+                            "toolCallId": event.part.tool_call_id,
+                            "toolName": event.part.tool_name,
+                            "input": event.part.args,
+                        })
+                    )
+                    
+                elif isinstance(event, FunctionToolResultEvent):
+                    print(f"🔧 TOOL RESULT RECEIVED for call_id: {event.result.tool_call_id}")
+                    print(f"🔧 TOOL OUTPUT: {event.result.content}")
+                    
+                    # Emit tool-output-available event
+                    result_content = (
+                        event.result.content.to_dict()
+                        if hasattr(event.result.content, "to_dict")
+                        else (
+                            event.result.content.model_dump()
+                            if hasattr(event.result.content, "model_dump")
+                            else event.result.content
+                        )
+                    )
+                    
+                    yield "data: {}\n\n".format(
+                        json.dumps({
+                            "type": "tool-output-available", 
+                            "toolCallId": event.result.tool_call_id,
+                            "output": result_content,
+                        })
+                    )
                         
     elif Agent.is_end_node(node):
         # Send text-end if we were streaming text
