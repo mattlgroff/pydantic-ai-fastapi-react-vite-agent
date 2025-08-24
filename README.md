@@ -28,7 +28,6 @@ I love Pydantic AI, but it's only available in Python. I love the Vercel AI SDK,
 **The Good Parts**
 - Both ecosystems have excellent hot reloading (FastAPI + Vite)
 - uv and Bun are both fantastic package managers
-- Each language excels in its domain (Python for AI, TypeScript for UX)
 
 **The Trade-offs**
 - No shared type safety across the stack
